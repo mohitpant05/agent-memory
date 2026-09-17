@@ -262,6 +262,7 @@ cmd_wire() {
     if [ "$PLATFORM" = macos ]; then
       [ ${#ENV_KEYS[@]} -gt 0 ] || fail ".env defines no MEM0_* variables"
       ARGS=(); for k in "${ENV_KEYS[@]}"; do ARGS+=(--env "$k=${!k}"); done
+      ARGS+=(--env "MEM0_AGENT_ID=claude-code")
       claude mcp add --scope user --transport stdio mem0 "${ARGS[@]}" -- "$BIN"
     else
       claude mcp add --scope user --transport http mem0 "http://${MEM0_HOST}:${MEM0_PORT}/mcp"
@@ -281,8 +282,10 @@ p = pathlib.Path(os.environ["KIRO_PATH"])
 cfg = json.loads(p.read_text()) if p.exists() else {}
 keys = os.environ["MEM0_ENV_KEYS"].split()
 if os.environ["PLATFORM"] == "macos":
-    entry = {"command": os.environ["BIN"], "args": [],
-             "env": {k: os.environ[k] for k in keys if k in os.environ}}
+    env = {k: os.environ[k] for k in keys if k in os.environ}
+    # Per-client, so it cannot live in the shared .env.
+    env["MEM0_AGENT_ID"] = "kiro"
+    entry = {"command": os.environ["BIN"], "args": [], "env": env}
 else:
     entry = {"url": f"http://{os.environ['MEM0_HOST']}:{os.environ['MEM0_PORT']}/mcp"}
 entry.update({
