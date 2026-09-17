@@ -1,0 +1,343 @@
+#!/usr/bin/env bash
+# agent-memory - single entrypoint. Detects the platform and does the right
+# thing for it.
+#
+#   ./memory-layer install   install everything (starts nothing)
+#   ./memory-layer start     bring the stack up
+#   ./memory-layer verify    end-to-end proof: add a fact, search it back
+#   ./memory-layer wire      register with Claude Code and Kiro
+#   ./memory-layer up        install + start + verify + wire, in order
+#   ./memory-layer status    what is running
+#   ./memory-layer stop      stop services (memories survive)
+#   ./memory-layer doctor    diagnose a broken setup
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$REPO_ROOT"
+# shellcheck source=lib/common.sh
+. "$REPO_ROOT/lib/common.sh"
+
+PLATFORM="$(detect_platform)"
+[ "$PLATFORM" = unsupported ] && fail "unsupported OS: $(uname -s). See docs/windows.md for WSL2."
+[ "$PLATFORM" = wsl ] && PLATFORM=linux && IS_WSL=1 || IS_WSL=0
+PLAT_DIR="$REPO_ROOT/platform/$PLATFORM"
+COMPOSE="$PLAT_DIR/docker-compose.yml"
+VENV="$REPO_ROOT/venv"
+BIN="$VENV/bin/mem0-mcp-selfhosted"
+ENVFILE="$REPO_ROOT/.env"
+SUDO=""; [ "$(id -u)" = 0 ] || SUDO=sudo
+
+load_env() {
+  [ -f "$ENVFILE" ] || fail "no .env - run: ./memory-layer install"
+  set -a; . "$ENVFILE"; set +a
+}
+
+# ---------------------------------------------------------------- install ----
+cmd_install() {
+  say "Platform: $PLATFORM$([ "$IS_WSL" = 1 ] && echo ' (WSL2)')"
+
+  if [ ! -f "$ENVFILE" ]; then
+    cp "$PLAT_DIR/env.defaults" "$ENVFILE"
+    ok "created .env from platform defaults"
+    printf '  Review it (especially MEM0_USER_ID%s), then re-run.\n' \
+      "$([ "$PLATFORM" = linux ] && echo ' and MEM0_HOST')"
+    exit 0
+  fi
+  load_env
+
+  say "Dependencies"
+  install_deps "$PLATFORM"
+
+  say "Preflight"
+  command -v docker >/dev/null || fail "docker not installed"
+  docker compose version >/dev/null 2>&1 || fail "docker compose v2 plugin missing"
+  docker info >/dev/null 2>&1 || fail "docker daemon not running$([ "$PLATFORM" = macos ] && echo ' (open Docker Desktop)')"
+  check_compose_conflict
+
+  if [ "$PLATFORM" = linux ] && [ "${MEM0_HOST:-}" = "0.0.0.0" ]; then
+    cat >&2 <<'WARN'
+REFUSING TO INSTALL.
+MEM0_HOST=0.0.0.0 exposes an MCP server that has NO inbound authentication.
+Anyone able to reach the port could read, overwrite, or delete every memory.
+Use 127.0.0.1 (with an SSH tunnel) or a Tailscale IP.
+WARN
+    exit 1
+  fi
+
+
+  if [ "$PLATFORM" = linux ]; then
+    $SUDO mkdir -p /etc/systemd/system/ollama.service.d
+    $SUDO cp "$PLAT_DIR/systemd/ollama-override.conf" \
+             /etc/systemd/system/ollama.service.d/override.conf
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl start ollama || true
+    ok "ollama systemd override installed"
+    command -v nvidia-smi >/dev/null \
+      && nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | sed 's/^/  GPU: /' \
+      || warn "no nvidia-smi; inference will be CPU-only"
+  fi
+
+  say "Qdrant"
+  docker compose -f "$COMPOSE" up -d
+  wait_for "$MEM0_QDRANT_URL/healthz" "Qdrant"
+
+  say "Models"
+  curl -sf -m 5 "$MEM0_OLLAMA_URL/api/version" >/dev/null \
+    || fail "ollama not serving at $MEM0_OLLAMA_URL (try: ollama serve)"
+  BASE_EMBED="${MEM0_EMBED_MODEL%-cpu}"
+  ensure_model "$BASE_EMBED"
+  ensure_model "$MEM0_LLM_MODEL"
+  if [ "$MEM0_EMBED_MODEL" != "$BASE_EMBED" ]; then
+    if model_present "$MEM0_EMBED_MODEL"; then
+      ok "$MEM0_EMBED_MODEL present"
+    else
+      printf 'FROM %s\nPARAMETER num_gpu 0\n' "$BASE_EMBED" > /tmp/Modelfile.mem0embed
+      ollama create "$MEM0_EMBED_MODEL" -f /tmp/Modelfile.mem0embed >/dev/null
+      rm -f /tmp/Modelfile.mem0embed
+      ok "CPU-pinned embedder created: $MEM0_EMBED_MODEL"
+    fi
+  fi
+
+  say "MCP server (pinned $MEM0_MCP_REF)"
+  if [ -x "$BIN" ]; then
+    ok "already installed (delete venv/ to reinstall)"
+  else
+    install_server "$VENV" "$MEM0_MCP_REF"
+  fi
+  install_patches "$VENV" "$ENVFILE"
+
+  if [ "$PLATFORM" = linux ]; then
+    say "systemd unit"
+    sed -e "s|__USER__|${SUDO_USER:-$USER}|g" -e "s|__PREFIX__|$REPO_ROOT|g" \
+      "$PLAT_DIR/systemd/mem0-mcp.service" \
+      | $SUDO tee /etc/systemd/system/mem0-mcp.service >/dev/null
+    $SUDO systemctl daemon-reload
+    ok "mem0-mcp.service installed (NOT started)"
+  fi
+
+  say "Installed"
+  printf '  Next: ./memory-layer start\n'
+}
+
+# ------------------------------------------------------------------ start ----
+cmd_start() {
+  load_env
+  docker compose -f "$COMPOSE" up -d
+  wait_for "$MEM0_QDRANT_URL/healthz" "Qdrant"
+  if [ "$PLATFORM" = linux ]; then
+    $SUDO systemctl enable --now ollama
+    $SUDO systemctl enable --now mem0-mcp
+    sleep 4
+    systemctl is-active --quiet mem0-mcp \
+      && ok "mem0-mcp active at http://${MEM0_HOST}:${MEM0_PORT}/mcp" \
+      || fail "mem0-mcp failed - journalctl -u mem0-mcp -n 50"
+  else
+    ok "stdio transport - the MCP client launches the server on demand"
+  fi
+}
+
+# ----------------------------------------------------------------- verify ----
+# Drives the REAL server over the MCP protocol. Anything less can pass while the
+# thing an agent actually calls is broken - which happened during development,
+# because a smoke test that sourced .env hid a wiring bug that dropped
+# MEM0_FACT_PROMPT_FILE.
+cmd_verify() {
+  load_env
+  [ -x "$BIN" ] || fail "server not installed - run: ./memory-layer install"
+  say "End-to-end verification over MCP"
+  BIN="$BIN" "$VENV/bin/python" - <<'PY'
+import json, os, subprocess, sys, uuid
+
+env = {k: v for k, v in os.environ.items()}
+proc = subprocess.Popen([env["BIN"]], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL, env=env, text=True, bufsize=1)
+
+def send(o): proc.stdin.write(json.dumps(o) + "\n"); proc.stdin.flush()
+def read():
+    while True:
+        line = proc.stdout.readline()
+        if not line: return None
+        try: return json.loads(line)
+        except json.JSONDecodeError: continue
+
+def call(name, args, _id=[100]):
+    _id[0] += 1
+    send({"jsonrpc": "2.0", "id": _id[0], "method": "tools/call",
+          "params": {"name": name, "arguments": args}})
+    r = read()
+    return json.loads(r["result"]["content"][0]["text"])
+
+send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+    "protocolVersion": "2024-11-05", "capabilities": {},
+    "clientInfo": {"name": "verify", "version": "1"}}})
+init = read()
+if not init or "result" not in init:
+    print("  FAILED: server did not initialize", file=sys.stderr); sys.exit(1)
+tools = init["result"].get("capabilities", {})
+send({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+print("  server initialized")
+
+tag = uuid.uuid4().hex[:8]
+scope = f"verify-{tag}"
+probe = ("The agent-memory layer pins mcp below 2 because MCP SDK 2.x renamed "
+         "FastMCP to MCPServer.")
+
+added = call("add_memory", {"text": probe, "user_id": scope,
+                            "metadata": {"verify": tag}})
+facts = added.get("results", [])
+print(f"  add_memory     -> {len(facts)} fact(s) extracted")
+for f in facts:
+    print("     -", f.get("memory"))
+if not facts:
+    print("  FAILED: extraction produced nothing.", file=sys.stderr)
+    print("  Most likely the fact prompt is not wired - see docs/troubleshooting.md",
+          file=sys.stderr)
+    call("delete_all_memories", {"user_id": scope}); proc.terminate(); sys.exit(1)
+
+hits = call("search_memories", {"query": "why is mcp pinned below version 2?",
+                                "user_id": scope, "limit": 3}).get("results", [])
+print(f"  search_memories -> {len(hits)} hit(s)")
+for h in hits:
+    print("     -", h.get("memory"))
+
+guard = call("delete_all_memories", {})
+guarded = isinstance(guard, dict) and "error" in guard
+print(f"  delete guard   -> {'refuses unscoped delete' if guarded else 'NOT ACTIVE'}")
+
+call("delete_all_memories", {"user_id": scope})
+left = call("get_memories", {"user_id": scope}).get("results", [])
+print(f"  cleanup        -> {len(left)} left in scope")
+proc.terminate()
+
+problems = []
+if not hits: problems.append("search returned nothing")
+if not guarded: problems.append("delete guard inactive")
+if left: problems.append("cleanup incomplete")
+if problems:
+    print("\n  FAILED: " + "; ".join(problems), file=sys.stderr); sys.exit(1)
+print("\n  PASS - add, search, guard and cleanup all verified over MCP")
+PY
+}
+
+# ------------------------------------------------------------------- wire ----
+cmd_wire() {
+  load_env
+  [ -x "$BIN" ] || fail "server not installed"
+  say "Wiring MCP clients"
+
+  # Env is derived from .env rather than hardcoded. A hardcoded list silently
+  # drops any variable added later - which is exactly how MEM0_FACT_PROMPT_FILE
+  # went missing once, leaving the server on mem0's default prompt returning
+  # zero facts while every test still passed.
+  ENV_KEYS=()
+  while IFS= read -r k; do
+    case "$k" in
+      MEM0_MCP_REF) continue ;;
+      MEM0_TRANSPORT) [ "$PLATFORM" = macos ] && continue ;;
+    esac
+    [ -n "${!k:-}" ] && ENV_KEYS+=("$k")
+  done < <(grep -oE '^MEM0_[A-Z_]+=' "$ENVFILE" | tr -d '=')
+
+  if command -v claude >/dev/null; then
+    claude mcp remove --scope user mem0 >/dev/null 2>&1 || true
+    if [ "$PLATFORM" = macos ]; then
+      ARGS=(); for k in "${ENV_KEYS[@]}"; do ARGS+=(--env "$k=${!k}"); done
+      claude mcp add --scope user --transport stdio mem0 "${ARGS[@]}" -- "$BIN"
+    else
+      claude mcp add --scope user --transport http mem0 "http://${MEM0_HOST}:${MEM0_PORT}/mcp"
+    fi
+    ok "Claude Code registered (${#ENV_KEYS[@]} env vars)"
+  else
+    warn "claude CLI not found - skipping Claude Code"
+  fi
+
+  KIRO="$HOME/.kiro/settings/mcp.json"
+  mkdir -p "$(dirname "$KIRO")"
+  [ -f "$KIRO" ] && cp "$KIRO" "$KIRO.bak.$(date +%s)" && warn "backed up $KIRO"
+  BIN="$BIN" PLATFORM="$PLATFORM" MEM0_ENV_KEYS="${ENV_KEYS[*]}" \
+  KIRO_PATH="$KIRO" python3 - <<'PY'
+import json, os, pathlib
+p = pathlib.Path(os.environ["KIRO_PATH"])
+cfg = json.loads(p.read_text()) if p.exists() else {}
+keys = os.environ["MEM0_ENV_KEYS"].split()
+if os.environ["PLATFORM"] == "macos":
+    entry = {"command": os.environ["BIN"], "args": [],
+             "env": {k: os.environ[k] for k in keys if k in os.environ}}
+else:
+    entry = {"url": f"http://{os.environ['MEM0_HOST']}:{os.environ['MEM0_PORT']}/mcp"}
+entry.update({
+    "disabled": False,
+    "autoApprove": ["search_memories", "get_memories", "get_memory"],
+    # Kiro can block tools outright; Claude Code has no equivalent, so there the
+    # protection is the permission prompt.
+    "disabledTools": ["delete_all_memories", "delete_entities"],
+})
+cfg.setdefault("mcpServers", {})["mem0"] = entry
+p.write_text(json.dumps(cfg, indent=2) + "\n")
+print(f"  Kiro registered -> {p}")
+PY
+  chmod 600 "$KIRO"
+  printf '\n  Restart your MCP clients - a running server keeps the env it started with.\n'
+}
+
+# ----------------------------------------------------------------- status ----
+cmd_status() {
+  docker compose -f "$COMPOSE" ps --format 'table {{.Name}}\t{{.Status}}' 2>/dev/null || true
+  ollama list 2>/dev/null || warn "ollama not responding"
+  [ -x "$BIN" ] && ok "server installed: $BIN" || warn "server not installed"
+  if [ "$PLATFORM" = linux ]; then
+    systemctl is-active --quiet mem0-mcp && ok "mem0-mcp: active" || warn "mem0-mcp: inactive"
+  fi
+  command -v claude >/dev/null && (claude mcp list 2>/dev/null | grep -i mem0 || warn "not registered with Claude Code")
+}
+
+# ------------------------------------------------------------------- stop ----
+cmd_stop() {
+  [ "$PLATFORM" = linux ] && { $SUDO systemctl stop mem0-mcp || true; }
+  docker compose -f "$COMPOSE" down
+  ok "stopped. Volume mem0-qdrant retained - memories intact."
+}
+
+# ----------------------------------------------------------------- doctor ----
+cmd_doctor() {
+  say "Diagnostics"
+  printf '  platform        : %s\n' "$PLATFORM"
+  printf '  docker daemon   : %s\n' "$(docker info >/dev/null 2>&1 && echo up || echo DOWN)"
+  [ -f "$ENVFILE" ] && printf '  .env            : present\n' || { printf '  .env            : MISSING\n'; return; }
+  load_env
+  printf '  qdrant          : %s\n' "$(curl -sf -m 3 "$MEM0_QDRANT_URL/healthz" >/dev/null 2>&1 && echo up || echo DOWN)"
+  printf '  ollama          : %s\n' "$(curl -sf -m 3 "$MEM0_OLLAMA_URL/api/version" >/dev/null 2>&1 && echo up || echo DOWN)"
+  printf '  llm model       : %s %s\n' "$MEM0_LLM_MODEL" "$(model_present "$MEM0_LLM_MODEL" && echo '(present)' || echo '(MISSING)')"
+  printf '  embed model     : %s %s\n' "$MEM0_EMBED_MODEL" "$(model_present "$MEM0_EMBED_MODEL" && echo '(present)' || echo '(MISSING)')"
+  case "$MEM0_LLM_MODEL" in
+    qwen3*|deepseek-r1*|qwq*|magistral*|phi4-reasoning*)
+      warn "reasoning model: returns empty content under mem0's num_predict. Prefer an instruct model." ;;
+  esac
+  if [ -n "${MEM0_FACT_PROMPT_FILE:-}" ] && [ -f "$MEM0_FACT_PROMPT_FILE" ]; then
+    printf '  fact prompt     : %s\n' "$MEM0_FACT_PROMPT_FILE"
+  else
+    warn "fact prompt NOT set/found - extraction will silently return nothing"
+  fi
+  if [ -x "$BIN" ]; then
+    SP="$(echo "$VENV"/lib/python3.*/site-packages)"
+    [ -f "$SP/zz_mem0_qwen_patch.pth" ] && printf '  runtime patches : installed\n' || warn "runtime patches MISSING"
+    "$VENV/bin/python" -c "import importlib.metadata as m; print('  mcp             :', m.version('mcp')); print('  mem0ai          :', m.version('mem0ai'))"
+  else
+    warn "server not installed"
+  fi
+}
+
+# --------------------------------------------------------------------- up ----
+cmd_up() { cmd_install; cmd_start; cmd_verify; cmd_wire; }
+
+case "${1:-up}" in
+  install) cmd_install ;;
+  start)   cmd_start ;;
+  verify)  cmd_verify ;;
+  wire)    cmd_wire ;;
+  status)  cmd_status ;;
+  stop)    cmd_stop ;;
+  doctor)  cmd_doctor ;;
+  up)      cmd_up ;;
+  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

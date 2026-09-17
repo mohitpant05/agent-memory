@@ -94,3 +94,65 @@ install_server() {
     || fail "import check failed - dependency resolution is wrong"
   ok "server installed and imports cleanly"
 }
+
+# ---------------------------------------------------------------- deps ------
+# Only four things are actually required: docker, ollama, uv and curl. Python is
+# NOT installed separately - uv downloads its own CPython 3.12 for the venv.
+# Node/npm are not needed at all: the server is Python, Qdrant is a container
+# and Ollama is a static binary.
+have() { command -v "$1" >/dev/null 2>&1; }
+: "${SUDO:=}"
+
+install_deps() {
+  local plat="$1" missing=()
+  for c in curl git; do have "$c" || missing+=("$c"); done
+  [ ${#missing[@]} -gt 0 ] && fail "install these first: ${missing[*]}"
+
+  if [ "$plat" = macos ]; then
+    if ! have brew; then
+      warn "Homebrew not found - installing (this prompts for your password)"
+      /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+      for p in /opt/homebrew/bin /usr/local/bin; do [ -x "$p/brew" ] && eval "$("$p/brew" shellenv)"; done
+    fi
+    have uv     || { warn "installing uv";     brew install uv; }
+    have ollama || { warn "installing ollama"; brew install ollama; }
+    if ! have docker; then
+      warn "installing Docker Desktop"
+      brew install --cask docker
+      printf '  Docker Desktop needs a manual first launch. Opening it now.\n'
+      open -a Docker || true
+    fi
+    pgrep -q ollama || { (ollama serve >/dev/null 2>&1 &) ; sleep 3; }
+  else
+    if ! have docker; then
+      warn "installing docker"
+      $SUDO apt-get update -qq
+      $SUDO apt-get install -y -qq docker.io docker-compose-v2
+      $SUDO usermod -aG docker "${SUDO_USER:-$USER}" || true
+      warn "added you to the docker group - log out and back in if docker still needs sudo"
+    fi
+    have uv     || { warn "installing uv";     curl -LsSf https://astral.sh/uv/install.sh | sh; export PATH="$HOME/.local/bin:$PATH"; }
+    have ollama || { warn "installing ollama"; curl -fsSL https://ollama.com/install.sh | sh; }
+  fi
+
+  have uv || fail "uv still not on PATH - open a new shell and re-run"
+  ok "dependencies satisfied (docker, ollama, uv)"
+}
+
+# A container from a DIFFERENT compose project holding our name would otherwise
+# fail mid-install with a raw daemon error.
+check_compose_conflict() {
+  local proj; proj="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' mem0-qdrant 2>/dev/null || true)"
+  if [ -n "$proj" ] && [ "$proj" != "agent-memory" ]; then
+    cat >&2 <<EOM
+A container named mem0-qdrant already exists from compose project "$proj".
+That is almost certainly an older hand-rolled setup. Your memories are in the
+named volume and will NOT be lost. Free the name with:
+
+    docker rm -f mem0-qdrant
+
+then re-run. (The volume mem0-qdrant is untouched by that command.)
+EOM
+    exit 1
+  fi
+}
