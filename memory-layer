@@ -29,7 +29,10 @@ SUDO=""; [ "$(id -u)" = 0 ] || SUDO=sudo
 
 load_env() {
   [ -f "$ENVFILE" ] || fail "no .env - run: ./memory-layer install"
-  set -a; . "$ENVFILE"; set +a
+  set -a
+  # shellcheck source=/dev/null  # .env is generated at install time
+  . "$ENVFILE"
+  set +a
 }
 
 # ---------------------------------------------------------------- install ----

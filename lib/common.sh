@@ -41,8 +41,9 @@ ensure_model() {
 }
 
 wait_for() {
-  local url="$1" name="$2" tries="${3:-30}" i
-  for i in $(seq 1 "$tries"); do
+  local url="$1" name="$2" tries="${3:-30}"
+  while [ "$tries" -gt 0 ]; do
+    tries=$((tries - 1))
     curl -sf -m 3 "$url" >/dev/null 2>&1 && { ok "$name ready"; return 0; }
     sleep 2
   done

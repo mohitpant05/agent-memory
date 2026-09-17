@@ -1,0 +1,59 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bash syntax
+        run: |
+          bash -n memory-layer
+          bash -n lib/common.sh
+
+      - name: ShellCheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning memory-layer lib/common.sh
+
+      - name: Python syntax
+        run: python3 -m py_compile patches/zz_mem0_qwen_patch.py
+
+      - name: Compose files validate
+        run: |
+          docker compose -f platform/macos/docker-compose.yml config -q
+          docker compose -f platform/linux/docker-compose.yml config -q
+
+      - name: Dependency ceilings are present
+        # The whole project breaks without these. mcp 2.x renamed FastMCP and
+        # mem0ai 2.x changed the search signature, so an unbounded install of
+        # either produces a server that cannot import or cannot run its hooks.
+        run: |
+          grep -q '"mcp\[cli\]>=1.23,<2"'     lib/common.sh || { echo "mcp ceiling missing";    exit 1; }
+          grep -q '"mem0ai\[llms\]>=1.0.3,<2"' lib/common.sh || { echo "mem0ai ceiling missing"; exit 1; }
+          grep -q -- '--no-deps'               lib/common.sh || { echo "--no-deps missing";      exit 1; }
+
+      - name: Defaults do not use a reasoning model
+        # Reasoning models spend mem0's num_predict budget in the thinking
+        # channel, which Ollama strips, so extraction silently returns nothing.
+        run: |
+          for f in platform/*/env.defaults; do
+            if grep -qE '^MEM0_LLM_MODEL=(qwen3|deepseek-r1|qwq|magistral|phi4-reasoning)' "$f"; then
+              echo "$f defaults to a reasoning model"; exit 1
+            fi
+          done
+
+      - name: Linux default binds loopback
+        run: grep -q '^MEM0_HOST=127.0.0.1' platform/linux/env.defaults
+
+      - name: No absolute home paths committed
+        run: |
+          if grep -rn '/Users/[a-z]' --include='*.sh' --include='*.md' --include='*.yml' \
+               --include='env.defaults' . ; then
+            echo "absolute home path committed"; exit 1
+          fi
