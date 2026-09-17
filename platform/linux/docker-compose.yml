@@ -1,0 +1,32 @@
+# Linux: Qdrant only.
+# Ollama and the MCP server run on the host under systemd. Docker *can* pass a
+# GPU through on Linux, but keeping Ollama on the host removes the
+# nvidia-container-toolkit dependency entirely and avoids needing
+# OLLAMA_HOST=0.0.0.0 (which would expose the LLM to the LAN).
+name: agent-memory
+
+services:
+  mem0-qdrant:
+    image: qdrant/qdrant:v1.19.1
+    container_name: mem0-qdrant
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6333:6333"
+    volumes:
+      - mem0-qdrant:/qdrant/storage
+    environment:
+      QDRANT__TELEMETRY_DISABLED: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+volumes:
+  mem0-qdrant:
+    name: mem0-qdrant

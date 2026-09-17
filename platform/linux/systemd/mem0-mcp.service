@@ -1,0 +1,36 @@
+# Installed to /etc/systemd/system/mem0-mcp.service
+[Unit]
+Description=agent-memory MCP server
+Documentation=https://github.com/mohitpant05/agent-memory
+After=network-online.target ollama.service docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=__USER__
+Group=__USER__
+# MEM0_HOST comes from .env and IS the bind address - there is no Docker
+# port-publish in front of this process, so hardcoding it here would silently
+# break the Tailscale option.
+EnvironmentFile=__PREFIX__/.env
+ExecStart=__PREFIX__/venv/bin/mem0-mcp-selfhosted
+Restart=on-failure
+RestartSec=5
+
+# Hardening. This service holds every memory you have.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=__PREFIX__
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
