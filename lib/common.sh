@@ -21,6 +21,7 @@ detect_platform() {
 # abort if absent.
 find_patches() {
   local c
+  : "${REPO_ROOT:=$PWD}"
   for c in "$REPO_ROOT/patches" "$PWD/patches" "$HOME/.mem0/patches" "/opt/mem0/patches"; do
     if [ -f "$c/zz_mem0_qwen_patch.py" ] && [ -f "$c/fact_prompt.txt" ]; then
       printf '%s\n' "$(cd "$c" && pwd)"; return 0
@@ -108,6 +109,7 @@ install_deps() {
   local plat="$1" missing=()
   for c in curl git; do have "$c" || missing+=("$c"); done
   [ ${#missing[@]} -gt 0 ] && fail "install these first: ${missing[*]}"
+  unset missing
 
   if [ "$plat" = macos ]; then
     if ! have brew; then

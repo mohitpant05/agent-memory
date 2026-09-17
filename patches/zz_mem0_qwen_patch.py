@@ -1,44 +1,49 @@
-"""Two runtime fixes for mem0-mcp-selfhosted, applied via a .pth at startup.
+"""Runtime fixes for mem0-mcp-selfhosted, loaded via a .pth at startup.
 
-1. think=False on Ollama chat calls for reasoning models
--------------------------------------------------------
-mem0's extraction sends options.num_predict (2000). Reasoning models such as
-qwen3 spend that entire budget in their *thinking* channel, which Ollama strips
-from message.content, so the call returns done_reason="length" with EMPTY
-content and mem0 extracts zero facts. The upstream wrapper appends "/no_think"
-to the prompt text, which does not work on Ollama 0.21+ (verified). The
-API-level think=False does.
+Nothing in the upstream package is edited, so a reinstall cannot lose these and
+the pinned commit stays byte-identical to what was reviewed.
+
+1. think=False for reasoning models
+-----------------------------------
+mem0 sends options.num_predict (2000). Reasoning models such as qwen3 spend that
+whole budget in their *thinking* channel, which Ollama strips from
+message.content, so the call returns done_reason="length" with EMPTY content and
+mem0 extracts zero facts. The upstream wrapper appends "/no_think" to the prompt
+TEXT, which does not work on Ollama 0.21+. The API-level think=False does.
 
 Measured on mem0's real FACT_RETRIEVAL_PROMPT, 3 inputs:
-    qwen3:4b             1/3 valid JSON
     qwen2.5:3b-instruct  3/3 valid JSON
-Non-thinking models are preferred here; this patch is the safety net.
-
-Set MEM0_OLLAMA_THINK=true to opt back into thinking.
+    qwen3:4b             1/3
+Prefer a non-thinking instruct model; this is the safety net.
+Opt out: MEM0_OLLAMA_THINK=true
 
 2. Engineering-oriented fact extraction prompt
 ----------------------------------------------
 mem0's built-in prompt opens "You are a Personal Information Organizer ...
 facts, user memories, and preferences". Measured: personal preferences extract
-fine, technical statements return an EMPTY list -
-    "The VRP repair tag prefilter fix moved placed tasks 232 -> 247"  ->  []
-which makes the memory layer silently useless for engineering context.
-
+fine, technical statements return an EMPTY list, which makes the whole layer
+silently useless for engineering context.
 Set MEM0_FACT_PROMPT_FILE to override. Unset = mem0's default.
 
-3. delete_all_memories empty-scope guard (upstream bug)
--------------------------------------------------------
-server.py:334 computes `uid = user_id or get_default_user_id()` and THEN checks
-`if not any([uid, agent_id, run_id])`. get_default_user_id() never returns
-empty, so the guard is unreachable and its error string is dead code - while
-the docstring promises "Requires at least one filter." A no-argument call
-therefore wipes the entire default user scope instead of refusing.
+3. delete_all_memories empty-scope guard
+----------------------------------------
+Upstream server.py:334 computes `uid = user_id or get_default_user_id()` and
+only THEN checks `if not any([uid, agent_id, run_id])`. get_default_user_id()
+never returns empty, so the guard is unreachable and its error string is dead
+code - while the docstring promises "Requires at least one filter." A no-arg
+call therefore wipes the entire default user scope. Sibling delete_entities
+checks the RAW params and is correct; the two disagree.
+Opt out: MEM0_ALLOW_UNSCOPED_DELETE_ALL=true (must be a real env var - this
+module loads from a .pth at interpreter startup, so setting it from inside
+Python is too late).
 
-Sibling delete_entities:388 checks the RAW params and is correct; the two
-disagree, which is what makes this a bug rather than a design choice.
-
-This patch restores the documented behaviour: an explicit scope is required.
-Set MEM0_ALLOW_UNSCOPED_DELETE_ALL=true to opt out.
+4. Default agent_id from MEM0_AGENT_ID
+--------------------------------------
+Upstream has no notion of which agent wrote a memory, so the store is a flat
+pile with no attribution. Setting agent_id does NOT partition it - verified: a
+search by user_id alone returns memories from every agent, while passing
+agent_id narrows to one. Attribution is free; sharing is unaffected.
+Set MEM0_AGENT_ID per client (e.g. claude-code, kiro). Unset = no attribution.
 """
 
 import os
@@ -46,12 +51,34 @@ import os
 _THINKING_MODELS = ("qwen3", "deepseek-r1", "qwq", "magistral", "phi4-reasoning")
 
 
-def _wants_think():
-    return os.environ.get("MEM0_OLLAMA_THINK", "").lower() in ("true", "1", "yes")
+def _truthy(name):
+    return os.environ.get(name, "").lower() in ("true", "1", "yes")
+
+
+def _wrap_create_server(flag, wrapper):
+    """Wrap srv._create_server once, applying `wrapper` to the built server."""
+    try:
+        from mem0_mcp_selfhosted import server as srv
+    except Exception:
+        return
+    if getattr(srv, flag, False):
+        return
+    original = srv._create_server
+
+    def _create_server():
+        server = original()
+        try:
+            wrapper(server)
+        except Exception:
+            pass
+        return server
+
+    srv._create_server = _create_server
+    setattr(srv, flag, True)
 
 
 def _patch_ollama_think():
-    if _wants_think():
+    if _truthy("MEM0_OLLAMA_THINK"):
         return
     try:
         import ollama
@@ -83,9 +110,6 @@ def _patch_fact_prompt():
         return
     try:
         text = open(path, encoding="utf-8").read()
-    except Exception:
-        return
-    try:
         from mem0_mcp_selfhosted import config as cfg
     except Exception:
         return
@@ -103,45 +127,56 @@ def _patch_fact_prompt():
 
 
 def _patch_delete_guard():
-    if os.environ.get("MEM0_ALLOW_UNSCOPED_DELETE_ALL", "").lower() in ("true", "1", "yes"):
+    if _truthy("MEM0_ALLOW_UNSCOPED_DELETE_ALL"):
         return
-    try:
-        from mem0_mcp_selfhosted import server as srv
-    except Exception:
+
+    def apply(server):
+        import json
+        tool = server._tool_manager._tools.get("delete_all_memories")
+        if tool is None:
+            return
+        inner = tool.fn
+
+        def guarded(user_id=None, agent_id=None, run_id=None, **kwargs):
+            if not any([user_id, agent_id, run_id]):
+                return json.dumps(
+                    {"error": "At least one scope (user_id, agent_id, or run_id) "
+                              "is required. Refusing to delete an unscoped set."},
+                    ensure_ascii=False,
+                )
+            return inner(user_id=user_id, agent_id=agent_id, run_id=run_id, **kwargs)
+
+        guarded.__name__ = getattr(inner, "__name__", "delete_all_memories")
+        guarded.__doc__ = getattr(inner, "__doc__", None)
+        tool.fn = guarded
+
+    _wrap_create_server("_mem0_delete_guard_patched", apply)
+
+
+def _patch_default_agent():
+    agent = os.environ.get("MEM0_AGENT_ID", "").strip()
+    if not agent:
         return
-    if getattr(srv, "_mem0_delete_guard_patched", False):
-        return
-    original_create = srv._create_server
 
-    def _create_server():
-        server = original_create()
-        try:
-            tool = server._tool_manager._tools.get("delete_all_memories")
-            if tool is None:
-                return server
-            inner = tool.fn
+    def apply(server):
+        tool = server._tool_manager._tools.get("add_memory")
+        if tool is None:
+            return
+        inner = tool.fn
 
-            def guarded(user_id=None, agent_id=None, run_id=None, **kwargs):
-                if not any([user_id, agent_id, run_id]):
-                    import json as _json
-                    return _json.dumps(
-                        {"error": "At least one scope (user_id, agent_id, or run_id) "
-                                  "is required. Refusing to delete an unscoped set."},
-                        ensure_ascii=False,
-                    )
-                return inner(user_id=user_id, agent_id=agent_id, run_id=run_id, **kwargs)
+        def tagged(*args, **kwargs):
+            if not kwargs.get("agent_id"):
+                kwargs["agent_id"] = agent
+            return inner(*args, **kwargs)
 
-            guarded.__name__ = getattr(inner, "__name__", "delete_all_memories")
-            guarded.__doc__ = getattr(inner, "__doc__", None)
-            tool.fn = guarded
-        except Exception:
-            pass
-        return server
+        tagged.__name__ = getattr(inner, "__name__", "add_memory")
+        tagged.__doc__ = getattr(inner, "__doc__", None)
+        tool.fn = tagged
 
-    srv._create_server = _create_server
-    srv._mem0_delete_guard_patched = True
+    _wrap_create_server("_mem0_agent_patched", apply)
 
 
 _patch_ollama_think()
 _patch_fact_prompt()
 _patch_delete_guard()
+_patch_default_agent()

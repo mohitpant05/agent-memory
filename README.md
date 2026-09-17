@@ -26,6 +26,7 @@ it works end to end, and registers it with your MCP clients. The first run
 writes `.env` and pauses so you can review it.
 
     ./memory-layer verify    prove it works, over the real MCP protocol
+    ./memory-layer graph     render the shared store as a local HTML page
     ./memory-layer doctor    diagnose a broken setup
     ./memory-layer status    what is running
     ./memory-layer stop      stop it (memories survive)

@@ -26,8 +26,8 @@ Return ONLY JSON in exactly this shape:
 
 Examples:
 
-Input: The VRP repair tag prefilter fix moved placed tasks from 232 to 247.
-Output: {"facts": ["The VRP repair tag prefilter fix increased placed tasks from 232 to 247"]}
+Input: The batch scheduler fix raised successfully placed jobs from 232 to 247.
+Output: {"facts": ["The batch scheduler fix increased successfully placed jobs from 232 to 247"]}
 
 Input: Remember that this project pins mcp<2 because 2.x renamed FastMCP.
 Output: {"facts": ["This project pins mcp<2", "mcp 2.x renamed FastMCP, which is why mcp is pinned below 2"]}

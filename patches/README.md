@@ -35,7 +35,7 @@ facts, user memories, and preferences"*. Measured:
 
     "I prefer dark roast coffee, I work as a software engineer"
         -> ["Prefers dark roast coffee", "Works as a software engineer"]
-    "The repair tag prefilter fix moved placed tasks from 232 to 247"
+    "The batch scheduler fix raised successfully placed jobs from 232 to 247"
         -> []
 
 Engineering statements return an **empty list**. For a memory layer whose

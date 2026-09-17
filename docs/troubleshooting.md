@@ -10,7 +10,7 @@ Measured behaviour:
 
     "I prefer dark roast coffee, I work as a software engineer"
         -> ['Prefers dark roast coffee', 'Works as a software engineer']
-    "The VRP repair tag prefilter fix moved placed tasks from 232 to 247"
+    "The batch scheduler fix raised successfully placed jobs from 232 to 247"
         -> []
 
 It discards technical statements. Fix: set `MEM0_FACT_PROMPT_FILE` to

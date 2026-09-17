@@ -9,6 +9,7 @@
 #   ./memory-layer up        install + start + verify + wire, in order
 #   ./memory-layer status    what is running
 #   ./memory-layer stop      stop services (memories survive)
+#   ./memory-layer graph     render the shared store as an HTML page
 #   ./memory-layer doctor    diagnose a broken setup
 set -euo pipefail
 
@@ -149,7 +150,17 @@ cmd_verify() {
   [ -x "$BIN" ] || fail "server not installed - run: ./memory-layer install"
   say "End-to-end verification over MCP"
   BIN="$BIN" "$VENV/bin/python" - <<'PY'
-import json, os, subprocess, sys, uuid
+import json, os, signal, subprocess, sys, uuid
+
+# A hung server (e.g. Ollama unreachable) would otherwise block readline
+# forever with no output at all.
+TIMEOUT = int(os.environ.get("MEM0_VERIFY_TIMEOUT", "180"))
+def _bail(*_):
+    print(f"  FAILED: no response within {TIMEOUT}s - check ./memory-layer doctor",
+          file=sys.stderr)
+    os._exit(1)
+signal.signal(signal.SIGALRM, _bail)
+signal.alarm(TIMEOUT)
 
 env = {k: v for k, v in os.environ.items()}
 proc = subprocess.Popen([env["BIN"]], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -218,6 +229,7 @@ if not guarded: problems.append("delete guard inactive")
 if left: problems.append("cleanup incomplete")
 if problems:
     print("\n  FAILED: " + "; ".join(problems), file=sys.stderr); sys.exit(1)
+signal.alarm(0)
 print("\n  PASS - add, search, guard and cleanup all verified over MCP")
 PY
 }
@@ -226,6 +238,10 @@ PY
 cmd_wire() {
   load_env
   [ -x "$BIN" ] || fail "server not installed"
+  # Without this the server falls back to mem0's default prompt and extracts
+  # nothing from technical input, while every surface still reports success.
+  [ -n "${MEM0_FACT_PROMPT_FILE:-}" ] && [ -f "$MEM0_FACT_PROMPT_FILE" ] \
+    || fail "MEM0_FACT_PROMPT_FILE unset or missing - run: ./memory-layer install"
   say "Wiring MCP clients"
 
   # Env is derived from .env rather than hardcoded. A hardcoded list silently
@@ -244,6 +260,7 @@ cmd_wire() {
   if command -v claude >/dev/null; then
     claude mcp remove --scope user mem0 >/dev/null 2>&1 || true
     if [ "$PLATFORM" = macos ]; then
+      [ ${#ENV_KEYS[@]} -gt 0 ] || fail ".env defines no MEM0_* variables"
       ARGS=(); for k in "${ENV_KEYS[@]}"; do ARGS+=(--env "$k=${!k}"); done
       claude mcp add --scope user --transport stdio mem0 "${ARGS[@]}" -- "$BIN"
     else
@@ -330,6 +347,15 @@ cmd_doctor() {
   fi
 }
 
+# ------------------------------------------------------------------ graph ----
+cmd_graph() {
+  load_env
+  say "Rendering shared memory"
+  MEM0_GRAPH_OUT="${MEM0_GRAPH_OUT:-$REPO_ROOT/memory-graph.html}" \
+    python3 "$REPO_ROOT/tools/graph.py"
+  printf '\n  Open it:  open %s\n' "${MEM0_GRAPH_OUT:-$REPO_ROOT/memory-graph.html}"
+}
+
 # --------------------------------------------------------------------- up ----
 cmd_up() { cmd_install; cmd_start; cmd_verify; cmd_wire; }
 
@@ -341,6 +367,7 @@ case "${1:-up}" in
   status)  cmd_status ;;
   stop)    cmd_stop ;;
   doctor)  cmd_doctor ;;
+  graph)   cmd_graph ;;
   up)      cmd_up ;;
-  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
