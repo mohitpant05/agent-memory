@@ -48,6 +48,26 @@ But the real fix is model choice. Measured on mem0's actual prompt, 3 inputs:
 qwen3 also degenerates into a whitespace loop mid-object and never closes the
 JSON. **Use a non-thinking instruct model.** Avoid qwen3, deepseek-r1, qwq.
 
+## Extraction runs forever / `Unterminated string` / `done_reason=length`
+
+The wrapper appends `" /no_think"` to the last user message for **every** Ollama
+model. On a non-thinking instruct model that is not a control directive, just
+text, and it derails generation. Measured on qwen2.5:3b-instruct with mem0's
+real prompt and identical options:
+
+    plain prompt            -> valid JSON, 2 facts
+    + " /no_think"          -> never terminates
+                               5220 chars at num_predict=2000
+                               20820 chars at num_predict=8000
+
+So the workaround for reasoning models breaks the models you should be using.
+`patches/` strips the injection for any model not in the thinking list; the
+API-level `think=False` already handles the reasoning ones properly.
+
+Symptom in the logs is a truncated JSON parse error such as
+`Error in new_retrieved_facts: Unterminated string starting at: line 1
+column 5217`.
+
 ## `ModuleNotFoundError: No module named 'mcp.server.fastmcp'`
 
 Upstream declares `mcp[cli]>=1.23.0` with **no upper bound**, but MCP SDK 2.x

@@ -37,7 +37,24 @@ Opt out: MEM0_ALLOW_UNSCOPED_DELETE_ALL=true (must be a real env var - this
 module loads from a .pth at interpreter startup, so setting it from inside
 Python is too late).
 
-4. Default agent_id from MEM0_AGENT_ID
+4. Strip the wrapper's "/no_think" text injection for non-thinking models
+-------------------------------------------------------------------------
+The wrapper appends " /no_think" to the last user message for every Ollama
+model. On a non-thinking instruct model that token is not a control directive,
+it is just text - and it derails generation. Measured on qwen2.5:3b-instruct
+with mem0's real prompt and identical options:
+
+    plain prompt                 -> valid JSON, 2 facts
+    + " /no_think" appended      -> runs to the token limit, never terminates
+                                    (5220 chars at num_predict=2000,
+                                     20820 chars at 8000: it simply never stops)
+
+So the workaround for reasoning models breaks the models you should actually be
+using. Fix 1 already handles reasoning models properly at the API level, so the
+text injection has no remaining purpose here and is removed for any model not in
+_THINKING_MODELS.
+
+5. Default agent_id from MEM0_AGENT_ID
 --------------------------------------
 Upstream has no notion of which agent wrote a memory, so the store is a flat
 pile with no attribution. Setting agent_id does NOT partition it - verified: a
@@ -153,6 +170,36 @@ def _patch_delete_guard():
     _wrap_create_server("_mem0_delete_guard_patched", apply)
 
 
+def _patch_strip_no_think():
+    """Remove " /no_think" from outbound messages for non-thinking models."""
+    try:
+        import ollama
+    except Exception:
+        return
+    cls = getattr(ollama, "Client", None)
+    if cls is None or getattr(cls, "_mem0_nothink_stripped", False):
+        return
+    original = cls.chat
+
+    def chat(self, *args, **kwargs):
+        model = kwargs.get("model") or (args[0] if args else "")
+        msgs = kwargs.get("messages")
+        if (isinstance(model, str) and isinstance(msgs, list)
+                and not any(model.startswith(p) for p in _THINKING_MODELS)):
+            cleaned = []
+            for m in msgs:
+                if isinstance(m, dict) and isinstance(m.get("content"), str) \
+                        and "/no_think" in m["content"]:
+                    m = dict(m)
+                    m["content"] = m["content"].replace(" /no_think", "").replace("/no_think", "")
+                cleaned.append(m)
+            kwargs["messages"] = cleaned
+        return original(self, *args, **kwargs)
+
+    cls.chat = chat
+    cls._mem0_nothink_stripped = True
+
+
 def _patch_default_agent():
     agent = os.environ.get("MEM0_AGENT_ID", "").strip()
     if not agent:
@@ -177,6 +224,7 @@ def _patch_default_agent():
 
 
 _patch_ollama_think()
+_patch_strip_no_think()
 _patch_fact_prompt()
 _patch_delete_guard()
 _patch_default_agent()
