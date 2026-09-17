@@ -1,0 +1,16 @@
+# Local config — contains machine-specific paths. Use .env.example as the template.
+.env
+.env.bak
+*.bak.*
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Runtime state written by mem0ai
+config.json
+history.db
+
+# OS
+.DS_Store
