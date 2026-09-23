@@ -34,6 +34,18 @@ Docker Desktop needs one manual launch the first time.
 
 Models unload after 30 minutes idle.
 
+## Ollama must survive reboots
+
+`Ollama.app` supervises its own server, so the installer adds it as a **login
+item**. Without that, every reboot leaves the layer silently dead — clients still
+report Connected because the server initialises lazily, but every add and search
+fails.
+
+`./memory-layer doctor` reports this as `ollama autostart`.
+
+Do not add a LaunchAgent for `ollama serve`; it crash-loops on
+`bind: address already in use` since the app already owns the port.
+
 ## Everyday
 
     ./memory-layer status

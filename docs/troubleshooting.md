@@ -1,5 +1,18 @@
 # Troubleshooting
 
+## First: "Connected" is not a health signal
+
+`claude mcp list` will show **mem0 ... ✔ Connected** even when the layer is
+completely non-functional, because the server initialises mem0 **lazily** — it
+connects immediately and only touches Qdrant or Ollama on the first tool call.
+
+Always diagnose with:
+
+    ./memory-layer doctor
+
+It prints one line per layer, so a dead dependency is obvious. Do not spend time
+on the client until doctor is clean.
+
 Every entry here was hit for real during setup, with the cause verified.
 
 ## `add_memory` returns 0 facts / search finds nothing
@@ -47,6 +60,23 @@ But the real fix is model choice. Measured on mem0's actual prompt, 3 inputs:
 
 qwen3 also degenerates into a whitespace loop mid-object and never closes the
 JSON. **Use a non-thinking instruct model.** Avoid qwen3, deepseek-r1, qwq.
+
+## Everything worked yesterday, now nothing stores
+
+Almost always Ollama is not running. Check `doctor`: it will show `ollama: DOWN`
+while `qdrant` reads up and the client still says Connected.
+
+On macOS, `Ollama.app` **supervises its own server process**. It is not the
+Homebrew formula (`brew services start ollama` fails with "Formula `ollama` is
+not installed"), so if the app is not a login item, every reboot leaves the
+memory layer silently dead until you open it by hand.
+
+`./memory-layer install` now detects this and adds the login item.
+`doctor` reports it as `ollama autostart`.
+
+**Do not add a LaunchAgent for `ollama serve` on macOS.** It crash-loops with
+`bind: address already in use` because the app already owns the port. Two
+supervisors fight; the login item is the correct mechanism.
 
 ## Extraction runs forever / `Unterminated string` / `done_reason=length`
 

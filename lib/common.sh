@@ -159,3 +159,53 @@ EOM
     exit 1
   fi
 }
+
+# ---------------------------------------------------------- autostart -------
+# Ollama going away is the single most likely way this breaks, and it is
+# invisible: the MCP server initialises mem0 lazily, so clients still report
+# "Connected" while every add and search fails.
+#
+# On macOS, Ollama.app SUPERVISES ITS OWN SERVER. Do not install a LaunchAgent
+# for `ollama serve` - it crash-loops on "bind: address already in use" because
+# the app already owns the port. Two supervisors fight. The correct fix is a
+# login item.
+ollama_autostart_state() {
+  case "$(detect_platform)" in
+    macos)
+      if [ ! -d /Applications/Ollama.app ]; then
+        echo "cli-only"; return
+      fi
+      if osascript -e 'tell application "System Events" to get the name of every login item' \
+           2>/dev/null | grep -qi ollama; then
+        echo "login-item"
+      else
+        echo "missing"
+      fi ;;
+    *)
+      if systemctl is-enabled --quiet ollama 2>/dev/null; then echo "systemd"; else echo "missing"; fi ;;
+  esac
+}
+
+ensure_ollama_autostart() {
+  local state; state="$(ollama_autostart_state)"
+  case "$state" in
+    login-item|systemd) ok "ollama starts automatically ($state)" ;;
+    cli-only)
+      warn "ollama is a CLI-only install with no supervisor; it will not survive a reboot"
+      warn "start it with 'ollama serve', or install Ollama.app" ;;
+    missing)
+      if [ "$(detect_platform)" = macos ]; then
+        warn "ollama would not survive a reboot - adding Ollama.app as a login item"
+        osascript -e 'tell application "System Events" to make login item at end with properties {path:"/Applications/Ollama.app", hidden:true}' >/dev/null 2>&1 || true
+        if [ "$(ollama_autostart_state)" = "login-item" ]; then
+          ok "ollama set to start at login"
+        else
+          warn "could not set the login item - add Ollama.app under System Settings > General > Login Items"
+        fi
+      else
+        $SUDO systemctl enable ollama >/dev/null 2>&1 \
+          && ok "ollama enabled at boot" \
+          || warn "could not enable ollama at boot - run: sudo systemctl enable ollama"
+      fi ;;
+  esac
+}

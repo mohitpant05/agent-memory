@@ -81,6 +81,8 @@ WARN
       || warn "no nvidia-smi; inference will be CPU-only"
   fi
 
+  ensure_ollama_autostart
+
   say "Qdrant"
   docker compose -f "$COMPOSE" up -d
   wait_for "$MEM0_QDRANT_URL/healthz" "Qdrant"
@@ -339,7 +341,17 @@ cmd_doctor() {
   [ -f "$ENVFILE" ] && printf '  .env            : present\n' || { printf '  .env            : MISSING\n'; return; }
   load_env
   printf '  qdrant          : %s\n' "$(curl -sf -m 3 "$MEM0_QDRANT_URL/healthz" >/dev/null 2>&1 && echo up || echo DOWN)"
-  printf '  ollama          : %s\n' "$(curl -sf -m 3 "$MEM0_OLLAMA_URL/api/version" >/dev/null 2>&1 && echo up || echo DOWN)"
+  OLLAMA_UP="$(curl -sf -m 3 "$MEM0_OLLAMA_URL/api/version" >/dev/null 2>&1 && echo up || echo DOWN)"
+  printf '  ollama          : %s\n' "$OLLAMA_UP"
+  # Liveness is not durability. Ollama dying on reboot is the most likely way
+  # this breaks, and it is invisible because clients still report "Connected".
+  case "$(ollama_autostart_state)" in
+    login-item) printf '  ollama autostart: yes (login item)\n' ;;
+    systemd)    printf '  ollama autostart: yes (systemd)\n' ;;
+    cli-only)   warn "ollama autostart: NO - CLI-only install, will not survive a reboot" ;;
+    *)          warn "ollama autostart: NO - run ./memory-layer install to fix" ;;
+  esac
+  [ "$OLLAMA_UP" = DOWN ] && warn "ollama is down: MCP clients will still say Connected, but every add and search fails"
   printf '  llm model       : %s %s\n' "$MEM0_LLM_MODEL" "$(model_present "$MEM0_LLM_MODEL" && echo '(present)' || echo '(MISSING)')"
   printf '  embed model     : %s %s\n' "$MEM0_EMBED_MODEL" "$(model_present "$MEM0_EMBED_MODEL" && echo '(present)' || echo '(MISSING)')"
   case "$MEM0_LLM_MODEL" in
